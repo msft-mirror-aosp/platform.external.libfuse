@@ -97,6 +97,11 @@ cc_library {
         "lib/mount_util.c",
     ],
 
+    // http://b/329787497 - LTO causes non-deterministic output
+    lto: {
+        never: true,
+    },
+
     apex_available: [
         "//apex_available:platform",
         "com.android.mediaprovider",
