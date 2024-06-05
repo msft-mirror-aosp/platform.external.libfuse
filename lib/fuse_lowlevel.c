@@ -2262,6 +2262,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		outarg.flags |= FUSE_ASYNC_DIO;
 	if (se->conn.want & FUSE_CAP_WRITEBACK_CACHE)
 		outarg.flags |= FUSE_WRITEBACK_CACHE;
+	if (se->conn.want & FUSE_CAP_PARALLEL_DIROPS)
+		outarg.flags |= FUSE_PARALLEL_DIROPS;
 	if (se->conn.want & FUSE_CAP_POSIX_ACL)
 		outarg.flags |= FUSE_POSIX_ACL;
 	if (se->conn.want & FUSE_CAP_PASSTHROUGH) {
@@ -2276,6 +2278,13 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		outarg.flags |= FUSE_EXPLICIT_INVAL_DATA;
 	if (se->conn.want & FUSE_CAP_SETXATTR_EXT)
 		outarg.flags |= FUSE_SETXATTR_EXT;
+
+	if (extended_flags) {
+		if (arg->flags & FUSE_INIT_EXT) {
+			outarg.flags |= FUSE_INIT_EXT;
+		}
+	}
+
 	outarg.max_readahead = se->conn.max_readahead;
 	outarg.max_write = se->conn.max_write;
 	if (se->conn.proto_minor >= 13) {
