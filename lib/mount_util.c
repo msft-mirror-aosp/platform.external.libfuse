@@ -8,9 +8,8 @@
   See the file COPYING.LIB.
 */
 
-#include "fuse_config.h"
+#include "config.h"
 #include "mount_util.h"
-
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -28,9 +27,7 @@
 #endif
 #include <sys/stat.h>
 #include <sys/wait.h>
-
-#include "fuse_mount_compat.h"
-
+#include <sys/mount.h>
 #include <sys/param.h>
 
 #if defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__) || defined(__FreeBSD_kernel__)
@@ -54,6 +51,7 @@ static int mtab_needs_update(const char *mnt)
 	 * Skip mtab update if /etc/mtab:
 	 *
 	 *  - doesn't exist,
+	 *  - is a symlink,
 	 *  - is on a read-only filesystem.
 	 */
 	res = lstat(_PATH_MOUNTED, &stbuf);
@@ -63,6 +61,9 @@ static int mtab_needs_update(const char *mnt)
 	} else {
 		uid_t ruid;
 		int err;
+
+		if (S_ISLNK(stbuf.st_mode))
+			return 0;
 
 		ruid = getuid();
 		if (ruid != 0)
