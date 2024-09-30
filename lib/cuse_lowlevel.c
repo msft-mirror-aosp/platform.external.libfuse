@@ -7,7 +7,7 @@
   See the file COPYING.LIB.
 */
 
-#include "fuse_config.h"
+#include "config.h"
 #include "cuse_lowlevel.h"
 #include "fuse_kernel.h"
 #include "fuse_i.h"
@@ -351,9 +351,10 @@ int cuse_lowlevel_main(int argc, char *argv[], const struct cuse_info *ci,
 		return 1;
 
 	if (multithreaded) {
-		struct fuse_loop_config *config = fuse_loop_cfg_create();
-		res = fuse_session_loop_mt(se, config);
-		fuse_loop_cfg_destroy(config);
+		struct fuse_loop_config config;
+		config.clone_fd = 0;
+		config.max_idle_threads = 10;
+		res = fuse_session_loop_mt_32(se, &config);
 	}
 	else
 		res = fuse_session_loop(se);
