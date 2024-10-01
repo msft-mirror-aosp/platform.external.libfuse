@@ -14,16 +14,16 @@
 #ifndef FUSE_COMMON_H_
 #define FUSE_COMMON_H_
 
-#ifdef HAVE_LIBFUSE_PRIVATE_CONFIG_H
-#include "fuse_config.h"
-#endif
-
-#include "libfuse_config.h"
-
 #include "fuse_opt.h"
 #include "fuse_log.h"
 #include <stdint.h>
 #include <sys/types.h>
+
+/** Major version of FUSE library interface */
+#define FUSE_MAJOR_VERSION 3
+
+/** Minor version of FUSE library interface */
+#define FUSE_MINOR_VERSION 10
 
 #define FUSE_MAKE_VERSION(maj, min)  ((maj) * 100 + (min))
 #define FUSE_VERSION FUSE_MAKE_VERSION(FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION)
@@ -42,7 +42,7 @@ extern "C" {
  * descriptors can share a single file handle.
  */
 struct fuse_file_info {
-	/** Open flags.	 Available in open(), release() and create() */
+	/** Open flags.	 Available in open() and release() */
 	int flags;
 
 	/** In case of a write operation indicates if this was caused
@@ -53,18 +53,15 @@ struct fuse_file_info {
 	    requests if write caching had been disabled. */
 	unsigned int writepage : 1;
 
-	/** Can be filled in by open/create, to use direct I/O on this file. */
+	/** Can be filled in by open, to use direct I/O on this file. */
 	unsigned int direct_io : 1;
 
-	/** Can be filled in by open and opendir. It signals the kernel that any
-	    currently cached data (ie., data that the filesystem provided the
-	    last time the file/directory was open) need not be invalidated when
-	    the file/directory is closed. */
+	/** Can be filled in by open. It signals the kernel that any
+	    currently cached file data (ie., data that the filesystem
+	    provided the last time the file was open) need not be
+	    invalidated. Has no effect when set in other contexts (in
+	    particular it does nothing when set by opendir()). */
 	unsigned int keep_cache : 1;
-
-	/** Can be filled by open/create, to allow parallel direct writes on this
-         *  file */
-        unsigned int parallel_direct_writes : 1;
 
 	/** Indicates a flush operation.  Set in flush operation, also
 	    maybe set in highlevel lock operation and lowlevel release
@@ -86,12 +83,8 @@ struct fuse_file_info {
 	    nothing when set by open()). */
 	unsigned int cache_readdir : 1;
 
-	/** Can be filled in by open, to indicate that flush is not needed
-	    on close. */
-	unsigned int noflush : 1;
-
 	/** Padding.  Reserved for future use*/
-	unsigned int padding : 23;
+	unsigned int padding : 25;
 	unsigned int padding2 : 32;
 
 	/** File handle id.  May be filled in by filesystem in create,
@@ -110,27 +103,13 @@ struct fuse_file_info {
 	/** Requested poll events.  Available in ->poll.  Only set on kernels
 	    which support it.  If unsupported, this field is set to zero. */
 	uint32_t poll_events;
-
-	/** Passthrough backing file id.  May be filled in by filesystem in
-	 * create and open.  It is used to create a passthrough connection
-	 * between FUSE file and backing file. */
-	int32_t backing_id;
 };
-
-
 
 /**
  * Configuration parameters passed to fuse_session_loop_mt() and
  * fuse_loop_mt().
- * Deprecated and replaced by a newer private struct in FUSE API
- * version 312 (FUSE_MAKE_VERSION(3, 12)
  */
-#if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 12)
-struct fuse_loop_config_v1; /* forward declarition */
 struct fuse_loop_config {
-#else
-struct fuse_loop_config_v1 {
-#endif
 	/**
 	 * whether to use separate device fds for each thread
 	 * (may increase performance)
@@ -149,7 +128,6 @@ struct fuse_loop_config_v1 {
 	 */
 	unsigned int max_idle_threads;
 };
-
 
 /**************************************************************************
  * Capability bits for 'fuse_conn_info.capable' and 'fuse_conn_info.want' *
@@ -186,11 +164,6 @@ struct fuse_loop_config_v1 {
 
 /**
  * Indicates that the filesystem supports lookups of "." and "..".
- *
- * When this flag is set, the filesystem must be prepared to receive requests
- * for invalid inodes (i.e., for which a FORGET request was received or
- * which have been used in a previous instance of the filesystem daemon) and
- * must not reuse node-ids (even when setting generation numbers).
  *
  * This feature is disabled by default.
  */
@@ -335,10 +308,8 @@ struct fuse_loop_config_v1 {
  * kernel. (If this flag is not set, returning ENOSYS will be treated
  * as an error and signaled to the caller).
  *
- * Setting this flag in the `want` field enables this behavior automatically
- * within libfuse for low level API users. If non-low level users wish to have
- * this behavior you must return `ENOSYS` from the open() handler on supporting
- * kernels.
+ * Setting (or unsetting) this flag in the `want` field has *no
+ * effect*.
  */
 #define FUSE_CAP_NO_OPEN_SUPPORT	(1 << 17)
 
@@ -347,6 +318,8 @@ struct fuse_loop_config_v1 {
  * is unset, the FUSE kernel module will ensure that lookup() and
  * readdir() requests are never issued concurrently for the same
  * directory.
+ *
+ * This feature is enabled by default when supported by the kernel.
  */
 #define FUSE_CAP_PARALLEL_DIROPS        (1 << 18)
 
@@ -374,26 +347,9 @@ struct fuse_loop_config_v1 {
  * setuid and setgid bits when a file is written, truncated, or
  * its owner is changed.
  *
- * This feature is disabled by default.
+ * This feature is enabled by default when supported by the kernel.
  */
 #define FUSE_CAP_HANDLE_KILLPRIV         (1 << 20)
-
-/**
- * Indicates that the filesystem is responsible for unsetting
- * setuid and setgid bit and additionally cap (stored as xattr) when a
- * file is written, truncated, or its owner is changed.
- * Upon write/truncate suid/sgid is only killed if caller
- * does not have CAP_FSETID. Additionally upon
- * write/truncate sgid is killed only if file has group
- * execute permission. (Same as Linux VFS behavior).
- * KILLPRIV_V2 requires handling of
- *   - FUSE_OPEN_KILL_SUIDGID (set in struct fuse_create_in::open_flags)
- *   - FATTR_KILL_SUIDGID (set in struct fuse_setattr_in::valid)
- *   - FUSE_WRITE_KILL_SUIDGID (set in struct fuse_write_in::write_flags)
- *
- * This feature is disabled by default.
- */
-#define FUSE_CAP_HANDLE_KILLPRIV_V2         (1 << 21)
 
 /**
  * Indicates that the kernel supports caching symlinks in its page cache.
@@ -416,10 +372,7 @@ struct fuse_loop_config_v1 {
  * flag is not set, returning ENOSYS will be treated as an error and signalled
  * to the caller.)
  *
- * Setting this flag in the `want` field enables this behavior automatically
- * within libfuse for low level API users.  If non-low level users with to have
- * this behavior you must return `ENOSYS` from the opendir() handler on
- * supporting kernels.
+ * Setting (or unsetting) this flag in the `want` field has *no effect*.
  */
 #define FUSE_CAP_NO_OPENDIR_SUPPORT    (1 << 24)
 
@@ -447,48 +400,11 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXPLICIT_INVAL_DATA    (1 << 25)
 
 /**
- * Indicates support that dentries can be expired.
- * 
- * Expiring dentries, instead of invalidating them, makes a difference for 
- * overmounted dentries, where plain invalidation would detach all submounts 
- * before dropping the dentry from the cache. If only expiry is set on the 
- * dentry, then any overmounts are left alone and until ->d_revalidate() 
- * is called.
- * 
- * Note: ->d_revalidate() is not called for the case of following a submount,
- * so invalidation will only be triggered for the non-overmounted case. 
- * The dentry could also be mounted in a different mount instance, in which case
- * any submounts will still be detached.
-*/
-#define FUSE_CAP_EXPIRE_ONLY      (1 << 26)
-
-/**
  * Indicates that an extended 'struct fuse_setxattr' is used by the kernel
  * side - extra_flags are passed, which are used (as of now by acl) processing.
  * For example FUSE_SETXATTR_ACL_KILL_SGID might be set.
  */
 #define FUSE_CAP_SETXATTR_EXT     (1 << 27)
-
-/**
- * Files opened with FUSE_DIRECT_IO do not support MAP_SHARED mmap. This restriction
- * is relaxed through FUSE_CAP_DIRECT_IO_RELAX (kernel flag: FUSE_DIRECT_IO_RELAX).
- * MAP_SHARED is disabled by default for FUSE_DIRECT_IO, as this flag can be used to
- * ensure coherency between mount points (or network clients) and with kernel page
- * cache as enforced by mmap that cannot be guaranteed anymore.
- */
-#define FUSE_CAP_DIRECT_IO_ALLOW_MMAP  (1 << 28)
-
-/**
- * Indicates support for passthrough mode access for read/write operations.
- *
- * If this flag is set in the `capable` field of the `fuse_conn_info`
- * structure, then the FUSE kernel module supports redirecting read/write
- * operations to the backing file instead of letting them to be handled
- * by the FUSE daemon.
- *
- * This feature is disabled by default.
- */
-#define FUSE_CAP_PASSTHROUGH_UPSTREAM      (1 << 29)
 
 /**
  * Indicates support for passthrough mode access for read/write operations.
@@ -632,29 +548,9 @@ struct fuse_conn_info {
 	unsigned time_gran;
 
 	/**
-	 * When FUSE_CAP_PASSTHROUGH is enabled, this is the maximum allowed
-	 * stacking depth of the backing files.  In current kernel, the maximum
-	 * allowed stack depth if FILESYSTEM_MAX_STACK_DEPTH (2), which includes
-	 * the FUSE passthrough layer, so the maximum stacking depth for backing
-	 * files is 1.
-	 *
-	 * The default is FUSE_BACKING_STACKED_UNDER (0), meaning that the
-	 * backing files cannot be on a stacked filesystem, but another stacked
-	 * filesystem can be stacked over this FUSE passthrough filesystem.
-	 *
-	 * Set this to FUSE_BACKING_STACKED_OVER (1) if backing files may be on
-	 * a stacked filesystem, such as overlayfs or another FUSE passthrough.
-	 * In this configuration, another stacked filesystem cannot be stacked
-	 * over this FUSE passthrough filesystem.
-	 */
-#define FUSE_BACKING_STACKED_UNDER	(0)
-#define FUSE_BACKING_STACKED_OVER	(1)
-	unsigned max_backing_stack_depth;
-
-	/**
 	 * For future use.
 	 */
-	unsigned reserved[21];
+	unsigned reserved[22];
 };
 
 struct fuse_session;
@@ -890,18 +786,6 @@ struct fuse_bufvec {
 	struct fuse_buf buf[1];
 };
 
-/**
- * libfuse version a file system was compiled with. Should be filled in from
- * defines in 'libfuse_config.h'
- */
-struct libfuse_version
-{
-	int major;
-	int minor;
-	int hotfix;
-	int padding;
-};
-
 /* Initialize bufvec with a single buffer of given size */
 #define FUSE_BUFVEC_INIT(size__)				\
 	((struct fuse_bufvec) {					\
@@ -970,45 +854,6 @@ int fuse_set_signal_handlers(struct fuse_session *se);
  */
 void fuse_remove_signal_handlers(struct fuse_session *se);
 
-/**
- * Create and set default config for fuse_session_loop_mt and fuse_loop_mt.
- *
- * @return anonymous config struct
- */
-struct fuse_loop_config *fuse_loop_cfg_create(void);
-
-/**
- * Free the config data structure
- */
-void fuse_loop_cfg_destroy(struct fuse_loop_config *config);
-
-/**
- * fuse_loop_config setter to set the number of max idle threads.
- */
-void fuse_loop_cfg_set_idle_threads(struct fuse_loop_config *config,
-				    unsigned int value);
-
-/**
- * fuse_loop_config setter to set the number of max threads.
- */
-void fuse_loop_cfg_set_max_threads(struct fuse_loop_config *config,
-				   unsigned int value);
-
-/**
- * fuse_loop_config setter to enable the clone_fd feature
- */
-void fuse_loop_cfg_set_clone_fd(struct fuse_loop_config *config,
-				unsigned int value);
-
-/**
- * Convert old config to more recernt fuse_loop_config2
- *
- * @param config current config2 type
- * @param v1_conf older config1 type (below FUSE API 312)
- */
-void fuse_loop_cfg_convert(struct fuse_loop_config *config,
-			   struct fuse_loop_config_v1 *v1_conf);
-
 /* ----------------------------------------------------------- *
  * Compatibility stuff					       *
  * ----------------------------------------------------------- */
@@ -1028,7 +873,7 @@ void fuse_loop_cfg_convert(struct fuse_loop_config *config,
  * On 32bit systems please add -D_FILE_OFFSET_BITS=64 to your compile flags!
  */
 
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#if defined(__GNUC__) && (__GNUC__ > 4 || __GNUC__ == 4 && __GNUC_MINOR__ >= 6) && !defined __cplusplus
 _Static_assert(sizeof(off_t) == 8, "fuse: off_t must be 64bit");
 #else
 struct _fuse_off_t_must_be_64bit_dummy_struct \
