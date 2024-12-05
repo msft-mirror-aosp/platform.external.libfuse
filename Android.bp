@@ -65,6 +65,11 @@ cc_defaults {
     ],
 }
 
+cc_library_headers {
+    name: "libfuse_headers",
+    export_include_dirs: ["include"],
+}
+
 cc_library {
     name: "libfuse",
     defaults: [
