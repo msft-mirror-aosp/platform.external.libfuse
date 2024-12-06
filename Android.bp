@@ -47,7 +47,7 @@ cc_defaults {
     cflags: [
         "-D_FILE_OFFSET_BITS=64",
         "-DFUSERMOUNT_DIR=\"/system/bin\"",
-        "-DFUSE_USE_VERSION=35",
+        "-DFUSE_USE_VERSION=317",
         "-Wall",
         "-Werror",
         "-Wextra",
@@ -63,6 +63,11 @@ cc_defaults {
 
     ldflags: [
     ],
+}
+
+cc_library_headers {
+    name: "libfuse_headers",
+    export_include_dirs: ["include"],
 }
 
 cc_library {
