@@ -9,11 +9,7 @@
   See the file COPYING.LIB
 */
 
-
-/* For pthread_rwlock_t */
-#define _GNU_SOURCE
-
-#include "config.h"
+#include "fuse_config.h"
 #include "fuse_i.h"
 #include "fuse_lowlevel.h"
 #include "fuse_opt.h"
@@ -59,7 +55,6 @@
 
 struct fuse_fs {
 	struct fuse_operations op;
-	struct fuse_module *m;
 	void *user_data;
 	int debug;
 };
@@ -81,8 +76,6 @@ struct lock_queue_element {
 	char **path2;
 	struct node **wnode2;
 	int err;
-	bool first_locked : 1;
-	bool second_locked : 1;
 	bool done : 1;
 };
 
@@ -252,7 +245,7 @@ static int fuse_load_so_module(const char *module)
 	int ret = -1;
 	char *tmp;
 	struct fusemod_so *so;
-	fuse_module_factory_t factory;
+	fuse_module_factory_t *factory;
 
 	tmp = malloc(strlen(module) + 64);
 	if (!tmp) {
@@ -274,13 +267,13 @@ static int fuse_load_so_module(const char *module)
 	}
 
 	sprintf(tmp, "fuse_module_%s_factory", module);
-	*(void**)(&factory) = dlsym(so->handle, tmp);
+	factory = (fuse_module_factory_t*)dlsym(so->handle, tmp);
 	if (factory == NULL) {
 		fuse_log(FUSE_LOG_ERR, "fuse: symbol <%s> not found in module: %s\n",
 			tmp, dlerror());
 		goto out_dlclose;
 	}
-	ret = fuse_register_module(module, factory, so);
+	ret = fuse_register_module(module, *factory, so);
 	if (ret)
 		goto out_dlclose;
 
@@ -1037,7 +1030,7 @@ static int try_get_path(struct fuse *f, fuse_ino_t nodeid, const char *name,
 
 	for (node = get_node(f, nodeid); node->nodeid != FUSE_ROOT_ID;
 	     node = node->parent) {
-		err = -ENOENT;
+		err = -ESTALE;
 		if (node->name == NULL || node->parent == NULL)
 			goto out_unlock;
 
@@ -1076,26 +1069,30 @@ static int try_get_path(struct fuse *f, fuse_ino_t nodeid, const char *name,
 	return err;
 }
 
-static void queue_element_unlock(struct fuse *f, struct lock_queue_element *qe)
+static int try_get_path2(struct fuse *f, fuse_ino_t nodeid1, const char *name1,
+			 fuse_ino_t nodeid2, const char *name2,
+			 char **path1, char **path2,
+			 struct node **wnode1, struct node **wnode2)
 {
-	struct node *wnode;
+	int err;
 
-	if (qe->first_locked) {
-		wnode = qe->wnode1 ? *qe->wnode1 : NULL;
-		unlock_path(f, qe->nodeid1, wnode, NULL);
-		qe->first_locked = false;
+	/* FIXME: locking two paths needs deadlock checking */
+	err = try_get_path(f, nodeid1, name1, path1, wnode1, true);
+	if (!err) {
+		err = try_get_path(f, nodeid2, name2, path2, wnode2, true);
+		if (err) {
+			struct node *wn1 = wnode1 ? *wnode1 : NULL;
+
+			unlock_path(f, nodeid1, wn1, NULL);
+			free(*path1);
+		}
 	}
-	if (qe->second_locked) {
-		wnode = qe->wnode2 ? *qe->wnode2 : NULL;
-		unlock_path(f, qe->nodeid2, wnode, NULL);
-		qe->second_locked = false;
-	}
+	return err;
 }
 
 static void queue_element_wakeup(struct fuse *f, struct lock_queue_element *qe)
 {
 	int err;
-	bool first = (qe == f->lockq);
 
 	if (!qe->path1) {
 		/* Just waiting for it to be unlocked */
@@ -1105,44 +1102,21 @@ static void queue_element_wakeup(struct fuse *f, struct lock_queue_element *qe)
 		return;
 	}
 
-	if (!qe->first_locked) {
+	if (qe->done)
+		return;  // Don't try to double-lock the element
+
+	if (!qe->path2) {
 		err = try_get_path(f, qe->nodeid1, qe->name1, qe->path1,
 				   qe->wnode1, true);
-		if (!err)
-			qe->first_locked = true;
-		else if (err != -EAGAIN)
-			goto err_unlock;
-	}
-	if (!qe->second_locked && qe->path2) {
-		err = try_get_path(f, qe->nodeid2, qe->name2, qe->path2,
-				   qe->wnode2, true);
-		if (!err)
-			qe->second_locked = true;
-		else if (err != -EAGAIN)
-			goto err_unlock;
+	} else {
+		err = try_get_path2(f, qe->nodeid1, qe->name1, qe->nodeid2,
+				    qe->name2, qe->path1, qe->path2, qe->wnode1,
+				    qe->wnode2);
 	}
 
-	if (qe->first_locked && (qe->second_locked || !qe->path2)) {
-		err = 0;
-		goto done;
-	}
+	if (err == -EAGAIN)
+		return;  /* keep trying */
 
-	/*
-	 * Only let the first element be partially locked otherwise there could
-	 * be a deadlock.
-	 *
-	 * But do allow the first element to be partially locked to prevent
-	 * starvation.
-	 */
-	if (!first)
-		queue_element_unlock(f, qe);
-
-	/* keep trying */
-	return;
-
-err_unlock:
-	queue_element_unlock(f, qe);
-done:
 	qe->err = err;
 	qe->done = true;
 	pthread_cond_signal(&qe->cond);
@@ -1180,8 +1154,6 @@ static void queue_path(struct fuse *f, struct lock_queue_element *qe)
 	struct lock_queue_element **qp;
 
 	qe->done = false;
-	qe->first_locked = false;
-	qe->second_locked = false;
 	pthread_cond_init(&qe->cond, NULL);
 	qe->next = NULL;
 	for (qp = &f->lockq; *qp != NULL; qp = &(*qp)->next);
@@ -1246,7 +1218,7 @@ static int get_path_nullok(struct fuse *f, fuse_ino_t nodeid, char **path)
 		*path = NULL;
 	} else {
 		err = get_path_common(f, nodeid, NULL, path, NULL);
-		if (err == -ENOENT)
+		if (err == -ESTALE)
 			err = 0;
 	}
 
@@ -1307,27 +1279,6 @@ static int check_dir_loop(struct fuse *f,
 	return 0;
 }
 #endif
-
-static int try_get_path2(struct fuse *f, fuse_ino_t nodeid1, const char *name1,
-			 fuse_ino_t nodeid2, const char *name2,
-			 char **path1, char **path2,
-			 struct node **wnode1, struct node **wnode2)
-{
-	int err;
-
-	/* FIXME: locking two paths needs deadlock checking */
-	err = try_get_path(f, nodeid1, name1, path1, wnode1, true);
-	if (!err) {
-		err = try_get_path(f, nodeid2, name2, path2, wnode2, true);
-		if (err) {
-			struct node *wn1 = wnode1 ? *wnode1 : NULL;
-
-			unlock_path(f, nodeid1, wn1, NULL);
-			free(*path1);
-		}
-	}
-	return err;
-}
 
 static int get_path2(struct fuse *f, fuse_ino_t nodeid1, const char *name1,
 		     fuse_ino_t nodeid2, const char *name2,
@@ -2668,9 +2619,6 @@ void fuse_fs_destroy(struct fuse_fs *fs)
 	fuse_get_context()->private_data = fs->user_data;
 	if (fs->op.destroy)
 		fs->op.destroy(fs->user_data);
-	if (fs->m)
-		fuse_put_module(fs->m);
-	free(fs);
 }
 
 static void fuse_lib_destroy(void *data)
@@ -2679,7 +2627,6 @@ static void fuse_lib_destroy(void *data)
 
 	fuse_create_context(f);
 	fuse_fs_destroy(f->fs);
-	f->fs = NULL;
 }
 
 static void fuse_lib_lookup(fuse_req_t req, fuse_ino_t parent,
@@ -3016,6 +2963,20 @@ static void fuse_lib_unlink(fuse_req_t req, fuse_ino_t parent,
 		fuse_prepare_interrupt(f, req, &d);
 		if (!f->conf.hard_remove && is_open(f, parent, name)) {
 			err = hide_node(f, path, parent, name);
+			if (!err) {
+				/* we have hidden the node so now check again under a lock in case it is not used any more */
+				if (!is_open(f, parent, wnode->name)) {
+					char *unlinkpath;
+
+					/* get the hidden file path, to unlink it */
+					if (try_get_path(f, wnode->nodeid, NULL, &unlinkpath, NULL, false) == 0) {
+						err = fuse_fs_unlink(f->fs, unlinkpath);
+						if (!err)
+							remove_node(f, parent, wnode->name);
+						free(unlinkpath);
+					}
+				}
+			}
 		} else {
 			err = fuse_fs_unlink(f->fs, path);
 			if (!err)
@@ -3192,7 +3153,9 @@ static void fuse_lib_create(fuse_req_t req, fuse_ino_t parent,
 					fi->direct_io = 1;
 				if (f->conf.kernel_cache)
 					fi->keep_cache = 1;
-
+				if (fi->direct_io &&
+				    f->conf.parallel_direct_writes)
+					fi->parallel_direct_writes = 1;
 			}
 		}
 		fuse_finish_interrupt(f, req, &d);
@@ -3272,6 +3235,14 @@ static void fuse_lib_open(fuse_req_t req, fuse_ino_t ino,
 
 			if (f->conf.auto_cache)
 				open_auto_cache(f, ino, path, fi);
+
+			if (f->conf.no_rofd_flush &&
+			    (fi->flags & O_ACCMODE) == O_RDONLY)
+				fi->noflush = 1;
+
+			if (fi->direct_io && f->conf.parallel_direct_writes)
+				fi->parallel_direct_writes = 1;
+
 		}
 		fuse_finish_interrupt(f, req, &d);
 	}
@@ -3403,6 +3374,8 @@ static void fuse_lib_opendir(fuse_req_t req, fuse_ino_t ino,
 		err = fuse_fs_opendir(f->fs, path, &fi);
 		fuse_finish_interrupt(f, req, &d);
 		dh->fh = fi.fh;
+		llfi->cache_readdir = fi.cache_readdir;
+		llfi->keep_cache = fi.keep_cache;
 	}
 	if (!err) {
 		if (fuse_reply_open(req, llfi) == -ENOENT) {
@@ -3568,14 +3541,6 @@ static int fill_dir_plus(void *dh_, const char *name, const struct stat *statp,
 
 	if (statp && (flags & FUSE_FILL_DIR_PLUS)) {
 		e.attr = *statp;
-
-		if (!is_dot_or_dotdot(name)) {
-			res = do_lookup(f, dh->nodeid, name, &e);
-			if (res) {
-				dh->error = res;
-				return 1;
-			}
-		}
 	} else {
 		e.attr.st_ino = FUSE_UNKNOWN_INO;
 		if (statp) {
@@ -3603,6 +3568,16 @@ static int fill_dir_plus(void *dh_, const char *name, const struct stat *statp,
 		}
 		if (extend_contents(dh, dh->needlen) == -1)
 			return 1;
+
+		if (statp && (flags & FUSE_FILL_DIR_PLUS)) {
+			if (!is_dot_or_dotdot(name)) {
+				res = do_lookup(f, dh->nodeid, name, &e);
+				if (res) {
+					dh->error = res;
+					return 1;
+				}
+			}
+		}
 
 		newlen = dh->len +
 			fuse_add_direntry_plus(dh->req, dh->contents + dh->len,
@@ -3676,6 +3651,7 @@ static int readdir_fill_from_list(fuse_req_t req, struct fuse_dh *dh,
 {
 	off_t pos;
 	struct fuse_direntry *de = dh->first;
+	int res;
 
 	dh->len = 0;
 
@@ -3700,6 +3676,16 @@ static int readdir_fill_from_list(fuse_req_t req, struct fuse_dh *dh,
 				.ino = 0,
 				.attr = de->stat,
 			};
+
+			if (!is_dot_or_dotdot(de->name)) {
+				res = do_lookup(dh->fuse, dh->nodeid,
+						de->name, &e);
+				if (res) {
+					dh->error = res;
+					return 1;
+				}
+			}
+
 			thislen = fuse_add_direntry_plus(req, p, rem,
 							 de->name, &e, pos);
 		} else {
@@ -4289,6 +4275,8 @@ static void fuse_lib_ioctl(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
 	fuse_finish_interrupt(f, req, &d);
 	free_path(f, ino, path);
 
+	if (err < 0)
+		goto err;
 	fuse_reply_ioctl(req, err, out_buf, out_bufsz);
 	goto out;
 err:
@@ -4574,8 +4562,8 @@ int fuse_loop(struct fuse *f)
 	return fuse_session_loop(f->se);
 }
 
-FUSE_SYMVER("fuse_loop_mt_32", "fuse_loop_mt@@FUSE_3.2")
-int fuse_loop_mt_32(struct fuse *f, struct fuse_loop_config *config)
+FUSE_SYMVER("fuse_loop_mt_312", "fuse_loop_mt@@FUSE_3.12")
+int fuse_loop_mt_312(struct fuse *f, struct fuse_loop_config *config)
 {
 	if (f == NULL)
 		return -1;
@@ -4584,8 +4572,25 @@ int fuse_loop_mt_32(struct fuse *f, struct fuse_loop_config *config)
 	if (res)
 		return -1;
 
-	res = fuse_session_loop_mt_32(fuse_get_session(f), config);
+	res = fuse_session_loop_mt_312(fuse_get_session(f), config);
 	fuse_stop_cleanup_thread(f);
+	return res;
+}
+
+int fuse_loop_mt_32(struct fuse *f, struct fuse_loop_config_v1 *config_v1);
+FUSE_SYMVER("fuse_loop_mt_32", "fuse_loop_mt@FUSE_3.2")
+int fuse_loop_mt_32(struct fuse *f, struct fuse_loop_config_v1 *config_v1)
+{
+	struct fuse_loop_config *config = fuse_loop_cfg_create();
+	if (config == NULL)
+		return ENOMEM;
+
+	fuse_loop_cfg_convert(config, config_v1);
+
+	int res = fuse_loop_mt_312(f, config);
+
+	fuse_loop_cfg_destroy(config);
+
 	return res;
 }
 
@@ -4593,10 +4598,19 @@ int fuse_loop_mt_31(struct fuse *f, int clone_fd);
 FUSE_SYMVER("fuse_loop_mt_31", "fuse_loop_mt@FUSE_3.0")
 int fuse_loop_mt_31(struct fuse *f, int clone_fd)
 {
-	struct fuse_loop_config config;
-	config.clone_fd = clone_fd;
-	config.max_idle_threads = 10;
-	return fuse_loop_mt_32(f, &config);
+	int err;
+	struct fuse_loop_config *config = fuse_loop_cfg_create();
+
+	if (config == NULL)
+		return ENOMEM;
+
+	fuse_loop_cfg_set_clone_fd(config, clone_fd);
+
+	err = fuse_loop_mt_312(f, config);
+
+	fuse_loop_cfg_destroy(config);
+
+	return err;
 }
 
 void fuse_exit(struct fuse *f)
@@ -4653,6 +4667,7 @@ static const struct fuse_opt fuse_lib_opts[] = {
 	FUSE_LIB_OPT("kernel_cache",	      kernel_cache, 1),
 	FUSE_LIB_OPT("auto_cache",	      auto_cache, 1),
 	FUSE_LIB_OPT("noauto_cache",	      auto_cache, 0),
+	FUSE_LIB_OPT("no_rofd_flush",	      no_rofd_flush, 1),
 	FUSE_LIB_OPT("umask=",		      set_mode, 1),
 	FUSE_LIB_OPT("umask=%o",	      umask, 0),
 	FUSE_LIB_OPT("uid=",		      set_uid, 1),
@@ -4667,6 +4682,7 @@ static const struct fuse_opt fuse_lib_opts[] = {
 	FUSE_LIB_OPT("noforget",              remember, -1),
 	FUSE_LIB_OPT("remember=%u",           remember, 0),
 	FUSE_LIB_OPT("modules=%s",	      modules, 0),
+	FUSE_LIB_OPT("parallel_direct_write=%d", parallel_direct_writes, 0),
 	FUSE_OPT_END
 };
 
@@ -4705,6 +4721,7 @@ void fuse_lib_help(struct fuse_args *args)
 	printf(
 "    -o kernel_cache        cache files in kernel\n"
 "    -o [no]auto_cache      enable caching based on modification times (off)\n"
+"    -o no_rofd_flush       disable flushing of read-only fd on close (off)\n"
 "    -o umask=M             set file permissions (octal)\n"
 "    -o uid=N               set file owner\n"
 "    -o gid=N               set file group\n"
@@ -4803,7 +4820,6 @@ static int fuse_push_module(struct fuse *f, const char *module,
 		fuse_put_module(m);
 		return -1;
 	}
-	newfs->m = m;
 	f->fs = newfs;
 	return 0;
 }
@@ -4874,11 +4890,19 @@ void fuse_stop_cleanup_thread(struct fuse *f)
 	}
 }
 
-
-FUSE_SYMVER("fuse_new_31", "fuse_new@@FUSE_3.1")
-struct fuse *fuse_new_31(struct fuse_args *args,
-		      const struct fuse_operations *op,
-		      size_t op_size, void *user_data)
+/*
+ * Not supposed to be called directly, but supposed to be called
+ * through the fuse_new macro
+ */
+struct fuse *_fuse_new_317(struct fuse_args *args,
+			   const struct fuse_operations *op,
+			   size_t op_size, struct libfuse_version *version,
+			   void *user_data);
+FUSE_SYMVER("_fuse_new_317", "_fuse_new@@FUSE_3.17")
+struct fuse *_fuse_new_317(struct fuse_args *args,
+			   const struct fuse_operations *op,
+			   size_t op_size, struct libfuse_version *version,
+			   void *user_data)
 {
 	struct fuse *f;
 	struct node *root;
@@ -4960,7 +4984,7 @@ struct fuse *fuse_new_31(struct fuse_args *args,
 	f->conf.readdir_ino = 1;
 #endif
 
-	f->se = fuse_session_new(args, &llop, sizeof(llop), f);
+	f->se = _fuse_session_new(args, &llop, sizeof(llop), version, f);
 	if (f->se == NULL)
 		goto out_free_fs;
 
@@ -5014,8 +5038,6 @@ out_free_name_table:
 out_free_session:
 	fuse_session_destroy(f->se);
 out_free_fs:
-	if (f->fs->m)
-		fuse_put_module(f->fs->m);
 	free(f->fs);
 	free(f->conf.modules);
 out_delete_context_key:
@@ -5027,16 +5049,62 @@ out:
 }
 
 /* Emulates 3.0-style fuse_new(), which processes --help */
+struct fuse *_fuse_new_30(struct fuse_args *args, const struct fuse_operations *op,
+			 size_t op_size,
+			 struct libfuse_version *version,
+			 void *user_data);
+FUSE_SYMVER("_fuse_new_30", "_fuse_new@FUSE_3.0")
+struct fuse *_fuse_new_30(struct fuse_args *args,
+			 const struct fuse_operations *op,
+			 size_t op_size,
+			 struct libfuse_version *version,
+			 void *user_data)
+{
+	struct fuse_config conf = {0};
+
+	const struct fuse_opt opts[] = {
+		FUSE_LIB_OPT("-h", show_help, 1),
+		FUSE_LIB_OPT("--help", show_help, 1),
+		FUSE_OPT_END
+	};
+
+	if (fuse_opt_parse(args, &conf, opts,
+			   fuse_lib_opt_proc) == -1)
+		return NULL;
+
+	if (conf.show_help) {
+		fuse_lib_help(args);
+		return NULL;
+	} else
+		return _fuse_new_317(args, op, op_size, version, user_data);
+}
+
+/* ABI compat version */
+struct fuse *fuse_new_31(struct fuse_args *args, const struct fuse_operations *op,
+			 size_t op_size, void *user_data);
+FUSE_SYMVER("fuse_new_31", "fuse_new@FUSE_3.1")
+struct fuse *fuse_new_31(struct fuse_args *args,
+			 const struct fuse_operations *op,
+			 size_t op_size, void *user_data)
+{
+		/* unknown version */
+	struct libfuse_version version = { 0 };
+
+	return _fuse_new_317(args, op, op_size, &version, user_data);
+}
+
+/*
+ * ABI compat version
+ * Emulates 3.0-style fuse_new(), which processes --help
+ */
 struct fuse *fuse_new_30(struct fuse_args *args, const struct fuse_operations *op,
-			 size_t op_size, void *private_data);
+			 size_t op_size, void *user_data);
 FUSE_SYMVER("fuse_new_30", "fuse_new@FUSE_3.0")
 struct fuse *fuse_new_30(struct fuse_args *args,
 			 const struct fuse_operations *op,
 			 size_t op_size, void *user_data)
 {
-	struct fuse_config conf;
-
-	memset(&conf, 0, sizeof(conf));
+	struct fuse_config conf = {0};
 
 	const struct fuse_opt opts[] = {
 		FUSE_LIB_OPT("-h", show_help, 1),
@@ -5054,6 +5122,7 @@ struct fuse *fuse_new_30(struct fuse_args *args,
 	} else
 		return fuse_new_31(args, op, op_size, user_data);
 }
+
 
 void fuse_destroy(struct fuse *f)
 {
@@ -5100,6 +5169,7 @@ void fuse_destroy(struct fuse *f)
 	free(f->name_table.array);
 	pthread_mutex_destroy(&f->lock);
 	fuse_session_destroy(f->se);
+	free(f->fs);
 	free(f->conf.modules);
 	free(f);
 	fuse_delete_context_key();
