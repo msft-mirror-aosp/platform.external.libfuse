@@ -11,11 +11,8 @@
 /*
   Versioned symbols cannot be used in some cases because it
     - not supported on MacOSX (in MachO binary format)
-
-  Note: "@@" denotes the default symbol, "@" is binary a compat version.
-
 */
-#ifdef LIBFUSE_BUILT_WITH_VERSIONED_SYMBOLS
+#ifndef __APPLE__
 # if HAVE_SYMVER_ATTRIBUTE
 #  define FUSE_SYMVER(sym1, sym2) __attribute__ ((symver (sym2)))
 # else
