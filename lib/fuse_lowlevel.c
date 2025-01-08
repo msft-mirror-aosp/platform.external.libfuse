@@ -2165,6 +2165,13 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		if (arg->max_readahead < se->conn.max_readahead)
 			se->conn.max_readahead = arg->max_readahead;
 		inargflags = arg->flags;
+		/* Unpatched Android Kernels using the old value for passthrough may
+		 * accidentally set all extended init values, while not meaning to
+		 * set any. If the old passthrough value is used, ignore extended
+		 * flags
+		 */
+		if ((inargflags & FUSE_INIT_EXT) && (inargflags & (1ULL << 31)))
+			inargflags &= ~FUSE_INIT_EXT;
 		if (inargflags & FUSE_INIT_EXT)
 			inargflags = inargflags | (uint64_t) arg->flags2 << 32;
 		if (inargflags & FUSE_ASYNC_READ)
@@ -2225,7 +2232,7 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			if (inargflags & (1ULL << 63))
 				se->conn.capable |= FUSE_CAP_PASSTHROUGH;
 		} else {
-			if (inargflags & (1 << 31))
+			if (inargflags & (1ULL << 31))
 				se->conn.capable |= FUSE_CAP_PASSTHROUGH;
 		}
 	} else {
@@ -2374,7 +2381,7 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		if (inargflags & FUSE_INIT_EXT)
 			outargflags |= (1ULL << 63);
 		else
-			outargflags |= (1 << 31);
+			outargflags |= (1ULL << 31);
 	}
 	if (inargflags & FUSE_INIT_EXT) {
 		outargflags |= FUSE_INIT_EXT;
