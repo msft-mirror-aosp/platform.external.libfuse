@@ -31,7 +31,7 @@
 
 #define FUSE_LOOP_MT_V2_IDENTIFIER	 INT_MAX - 2
 #define FUSE_LOOP_MT_DEF_CLONE_FD	 0
-#define FUSE_LOOP_MT_DEF_MAX_THREADS 10
+#define FUSE_LOOP_MT_DEF_MAX_THREADS 100
 #define FUSE_LOOP_MT_DEF_IDLE_THREADS -1 /* thread destruction is disabled
                                           * by default */
 
